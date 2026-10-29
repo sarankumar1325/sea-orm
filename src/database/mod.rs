@@ -94,6 +94,7 @@ type AfterConnectCallback = Option<
 #[derive(derive_more::Debug, Clone)]
 pub struct ConnectOptions {
     /// The URI of the database
+    #[debug("{:?}", redact_url_password(url))]
     pub(crate) url: String,
     /// Maximum number of connections for a pool
     pub(crate) max_connections: Option<u32>,
@@ -119,6 +120,7 @@ pub struct ConnectOptions {
     /// SQLx slow statements duration threshold (ignored if `sqlx_logging` is false)
     pub(crate) sqlx_slow_statements_logging_threshold: Duration,
     /// set sqlcipher key
+    #[debug("{:?}", sqlcipher_key.as_ref().map(|_| REDACTED))]
     pub(crate) sqlcipher_key: Option<Cow<'static, str>>,
     /// Schema search path (PostgreSQL only)
     pub(crate) schema_search_path: Option<String>,
@@ -241,6 +243,27 @@ impl Database {
                 );
             }
         }
+    }
+}
+
+// Only used by the derived `Debug` impl of `ConnectOptions`, which dead code analysis ignores
+#[allow(dead_code)]
+const REDACTED: &str = "<redacted>";
+
+/// Replace the password of a database URL so that it can be safely printed
+#[allow(dead_code)]
+fn redact_url_password(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            if parsed.password().is_some() && parsed.set_password(Some(REDACTED)).is_ok() {
+                parsed.to_string()
+            } else {
+                url.to_owned()
+            }
+        }
+        // Not a valid URL; avoid printing anything that may contain credentials
+        Err(_) if url.contains('@') => REDACTED.to_owned(),
+        Err(_) => url.to_owned(),
     }
 }
 
@@ -748,5 +771,49 @@ impl ConnectOptions {
     {
         self.sqlite_before_acquire_fn = Some(Arc::new(f));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_options_debug_redacts_secrets() {
+        let mut opt = ConnectOptions::new("postgres://app:s3cr3t@127.0.0.1:5432/app");
+        opt.sqlcipher_key("k3y");
+        let debug = format!("{opt:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        assert!(!debug.contains("k3y"), "{debug}");
+        assert!(
+            debug.contains(r#"url: "postgres://app:%3Credacted%3E@127.0.0.1:5432/app""#),
+            "{debug}"
+        );
+        assert!(
+            debug.contains(r#"sqlcipher_key: Some("<redacted>")"#),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn connect_options_debug_keeps_url_without_password() {
+        for url in [
+            "sqlite::memory:",
+            "sqlite://db.sqlite?mode=rwc",
+            "mysql://root@localhost/app",
+        ] {
+            let debug = format!("{:?}", ConnectOptions::new(url));
+            assert!(debug.contains(&format!("url: {url:?}")), "{debug}");
+            assert!(debug.contains("sqlcipher_key: None"), "{debug}");
+        }
+    }
+
+    #[test]
+    fn redact_url_password_handles_invalid_url() {
+        assert_eq!(redact_url_password("not a url"), "not a url");
+        assert_eq!(
+            redact_url_password("postgres://app:s3cr3t@[::1/app"),
+            REDACTED
+        );
     }
 }
